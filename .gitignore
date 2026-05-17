@@ -9,3 +9,14 @@
 .cxx
 local.properties
 /app/build
+
+# Release signing — NEVER commit
+keystore.properties
+*.jks
+*.keystore
+/keystore/
+
+# Build outputs
+/app/release/
+*.aab
+*.apk

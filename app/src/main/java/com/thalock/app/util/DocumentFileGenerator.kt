@@ -1,8 +1,12 @@
 package com.thalock.app.util
 
 import android.content.Context
+import android.webkit.MimeTypeMap
 import com.thalock.app.data.model.Document
+import com.thalock.app.data.model.UploadedFile
+import com.thalock.app.security.FileCryptoManager
 import java.io.File
+import java.io.FileOutputStream
 
 object DocumentFileGenerator {
 
@@ -40,6 +44,48 @@ object DocumentFileGenerator {
 
         file.writeText(content)
         return file
+    }
+
+    /**
+     * Decrypts an [UploadedFile]'s on-disk ciphertext into a plaintext copy
+     * under the app's shared-docs cache, and returns that plaintext file.
+     *
+     * Used by SAF/picker flows where an external app needs a real readable
+     * handle to the raw content the user originally uploaded. The caller is
+     * responsible for deleting the returned file when the consumer has closed
+     * its file descriptor (see [ThaLockDocumentProvider.openDocument]).
+     */
+    fun materializeUploadedFile(context: Context, file: UploadedFile): File {
+        val dir = File(context.cacheDir, "shared_docs")
+        if (!dir.exists()) dir.mkdirs()
+
+        // Preserve the original name + extension so the consuming app gets a
+        // sensible filename. We prepend the DB id to avoid collisions when the
+        // user has two uploads with the same name.
+        val safeName = file.name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val ext = extensionFor(file).orEmpty()
+        val baseName = if (safeName.contains('.')) safeName else if (ext.isNotEmpty()) "$safeName.$ext" else safeName
+        val target = File(dir, "${file.id}_$baseName")
+
+        FileCryptoManager.decryptInputStream(File(file.filePath)).use { input ->
+            FileOutputStream(target).use { output ->
+                input.copyTo(output)
+            }
+        }
+        return target
+    }
+
+    /**
+     * Best-effort file extension for an UploadedFile: prefer the MIME we
+     * captured at upload time; fall back to whatever sits on the saved name.
+     */
+    fun extensionFor(file: UploadedFile): String? {
+        file.mimeType
+            ?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        val dot = file.name.lastIndexOf('.')
+        return if (dot > 0 && dot < file.name.length - 1) file.name.substring(dot + 1) else null
     }
 
     /**

@@ -3,4 +3,10 @@
     <cache-path
         name="shared_docs"
         path="shared_docs/" />
+    <!-- Temporary storage for camera captures from the Add Document flow.
+         The TakePicture contract writes a JPEG here via a FileProvider URI,
+         then we read+encrypt it into uploads/ and delete this scratch file. -->
+    <cache-path
+        name="captures"
+        path="captures/" />
 </paths>

@@ -1,6 +1,5 @@
 package com.thalock.app.provider
 
-import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.os.CancellationSignal
@@ -11,19 +10,27 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import com.thalock.app.R
 import com.thalock.app.data.database.AppDatabase
+import com.thalock.app.data.model.UploadedFile
 import com.thalock.app.security.SafExposurePreference
 import com.thalock.app.security.SessionKey
 import com.thalock.app.util.DocumentFileGenerator
-import java.io.File
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 
 /**
- * A DocumentsProvider that exposes ThaLock vault documents to Android's
- * Storage Access Framework (SAF). When any app triggers a file picker
- * (e.g. "Attach document"), ThaLock appears as a source.
+ * A DocumentsProvider that exposes ThaLock's *uploaded files* (the actual
+ * documents the user has attached — PDFs, photos, scans, etc.) to Android's
+ * Storage Access Framework. When any app triggers a file picker, ThaLock
+ * appears as a source and serves real decrypted file content, not a text
+ * summary of a saved ID record.
  *
- * Session-gated: documents are only served when [SessionKey] is unlocked
- * (i.e. the user has authenticated in ThaLock recently). If locked,
- * queries return empty results so no data leaks.
+ * Saved Documents (IDs, cards, insurance metadata) are NOT exposed through
+ * this provider — they are in-app structured data, not shareable files. If
+ * the user wants to share the raw photo/PDF they scanned, that lives as an
+ * UploadedFile and is surfaced here.
+ *
+ * Session-gated: file listings / reads only work when [SessionKey] is
+ * unlocked AND the user hasn't disabled SAF exposure in Settings.
  */
 class ThaLockDocumentProvider : DocumentsProvider() {
 
@@ -55,12 +62,7 @@ class ThaLockDocumentProvider : DocumentsProvider() {
         return AppDatabase.getInstance(context!!)
     }
 
-    /**
-     * Background thread that receives the close callback for each exported
-     * plaintext file. Required because [ParcelFileDescriptor.open] with a
-     * close listener needs a Handler, and we must not block the main thread
-     * waiting to delete the file on close.
-     */
+    /** Background handler for delete-on-close callbacks from [openDocument]. */
     private val closeHandlerThread by lazy {
         HandlerThread("ThaLockPfdClose").also { it.start() }
     }
@@ -84,7 +86,9 @@ class ThaLockDocumentProvider : DocumentsProvider() {
         val result = MatrixCursor(projection ?: ROOT_PROJECTION)
         result.newRow().apply {
             add(DocumentsContract.Root.COLUMN_ROOT_ID, ROOT_ID)
-            add(DocumentsContract.Root.COLUMN_MIME_TYPES, "text/plain")
+            // Advertise a broad mime set so pickers from any app surface us.
+            // The actual per-file MIME is reported from queryDocument/queryChildDocuments.
+            add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
             add(
                 DocumentsContract.Root.COLUMN_FLAGS,
                 DocumentsContract.Root.FLAG_LOCAL_ONLY
@@ -111,17 +115,10 @@ class ThaLockDocumentProvider : DocumentsProvider() {
             }
         } else if (canServe()) {
             val id = documentId?.toLongOrNull() ?: return result
-            val doc = getDatabase().documentDao().getDocumentByIdSync(id) ?: return result
-            val safeTitle = doc.title.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-
-            result.newRow().apply {
-                add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, doc.id.toString())
-                add(DocumentsContract.Document.COLUMN_MIME_TYPE, "text/plain")
-                add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, "${safeTitle}.txt")
-                add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, doc.updatedAt)
-                add(DocumentsContract.Document.COLUMN_FLAGS, 0)
-                add(DocumentsContract.Document.COLUMN_SIZE, null)
-            }
+            val file = runBlocking {
+                getDatabase().uploadedFileDao().getFileById(id)
+            } ?: return result
+            addUploadedFileRow(result, file)
         }
 
         return result
@@ -134,29 +131,17 @@ class ThaLockDocumentProvider : DocumentsProvider() {
     ): Cursor {
         val result = MatrixCursor(projection ?: DOC_PROJECTION)
 
-        // Only serve documents when the vault is unlocked AND the user hasn't
-        // disabled SAF exposure from Settings.
         if (!canServe()) return result
 
         if (parentDocumentId == ROOT_DOC_ID) {
-            val documents = getDatabase().documentDao().getAllDocumentsSync()
-            for (doc in documents) {
-                val safeTitle = doc.title.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                val subtitle = doc.country
-                    ?.let { "${it.displayName} - ${doc.documentType.displayName}" }
-                    ?: doc.documentType.displayName
-
-                result.newRow().apply {
-                    add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, doc.id.toString())
-                    add(DocumentsContract.Document.COLUMN_MIME_TYPE, "text/plain")
-                    add(
-                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                        "${doc.title} ($subtitle).txt"
-                    )
-                    add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, doc.updatedAt)
-                    add(DocumentsContract.Document.COLUMN_FLAGS, 0)
-                    add(DocumentsContract.Document.COLUMN_SIZE, null)
-                }
+            // Snapshot the Flow on the current (binder) thread via runBlocking +
+            // first(). The provider is called synchronously by SAF, so we must
+            // not suspend back to a UI dispatcher here.
+            val files = runBlocking {
+                getDatabase().uploadedFileDao().getAllFiles().first()
+            }
+            for (file in files) {
+                addUploadedFileRow(result, file)
             }
         }
 
@@ -175,18 +160,44 @@ class ThaLockDocumentProvider : DocumentsProvider() {
         val id = documentId?.toLongOrNull()
             ?: throw IllegalArgumentException("Invalid document ID")
 
-        val doc = getDatabase().documentDao().getDocumentByIdSync(id)
-            ?: throw IllegalStateException("Document not found")
+        val uploaded = runBlocking {
+            getDatabase().uploadedFileDao().getFileById(id)
+        } ?: throw IllegalStateException("File not found")
 
-        val file = DocumentFileGenerator.generateTextFile(context!!, doc)
+        // Materialize the encrypted blob into a plaintext cache file for the
+        // duration of the consumer's read, then delete it the moment they
+        // close the descriptor. Never leave decrypted bytes on disk longer
+        // than the share lasts.
+        val plaintext = DocumentFileGenerator.materializeUploadedFile(context!!, uploaded)
 
-        // Delete the plaintext export as soon as the consuming app closes its
-        // file descriptor. This keeps the cache from accumulating decrypted
-        // documents after a share / attach completes.
         return ParcelFileDescriptor.open(
-            file,
+            plaintext,
             ParcelFileDescriptor.MODE_READ_ONLY,
             closeHandler
-        ) { file.delete() }
+        ) { plaintext.delete() }
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal
+    // -------------------------------------------------------------------------
+
+    private fun addUploadedFileRow(cursor: MatrixCursor, file: UploadedFile) {
+        val ext = DocumentFileGenerator.extensionFor(file)
+        val displayName = if (!file.name.contains('.') && !ext.isNullOrBlank()) {
+            "${file.name}.$ext"
+        } else {
+            file.name
+        }
+        cursor.newRow().apply {
+            add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, file.id.toString())
+            add(
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                file.mimeType ?: "application/octet-stream"
+            )
+            add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, displayName)
+            add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, file.createdAt)
+            add(DocumentsContract.Document.COLUMN_FLAGS, 0)
+            add(DocumentsContract.Document.COLUMN_SIZE, file.sizeBytes)
+        }
     }
 }

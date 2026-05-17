@@ -25,7 +25,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
 import com.thalock.app.data.database.AppDatabase
-import com.thalock.app.data.model.Document
+import com.thalock.app.data.model.UploadedFile
 import com.thalock.app.security.AppLockManager
 import com.thalock.app.security.BiometricHelper
 import com.thalock.app.security.LockMethod
@@ -108,8 +108,8 @@ class DocumentPickerActivity : FragmentActivity() {
                         }
                     }
                 } else {
-                    DocumentSelectionScreen(
-                        onDocumentSelected = { document -> shareDocument(document) },
+                    UploadedFileSelectionScreen(
+                        onFileSelected = { file -> shareUploadedFile(file) },
                         onCancel = {
                             setResult(Activity.RESULT_CANCELED)
                             finish()
@@ -172,8 +172,12 @@ class DocumentPickerActivity : FragmentActivity() {
         )
     }
 
-    private fun shareDocument(document: Document) {
-        val file = DocumentFileGenerator.generateTextFile(this, document)
+    private fun shareUploadedFile(uploaded: UploadedFile) {
+        // Materialize the encrypted blob to a plaintext cache file so the
+        // receiving app has a real readable handle. cleanCache() in onDestroy
+        // (and per-file delete-on-close in the DocumentsProvider flow) keeps
+        // this from accumulating.
+        val file = DocumentFileGenerator.materializeUploadedFile(this, uploaded)
         val uri = FileProvider.getUriForFile(
             this,
             "${applicationContext.packageName}.fileprovider",
@@ -182,6 +186,7 @@ class DocumentPickerActivity : FragmentActivity() {
 
         val resultIntent = Intent().apply {
             data = uri
+            setDataAndType(uri, uploaded.mimeType ?: "application/octet-stream")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         setResult(Activity.RESULT_OK, resultIntent)
@@ -289,18 +294,18 @@ private fun PickerAuthScreen(
 }
 
 @Composable
-private fun DocumentSelectionScreen(
-    onDocumentSelected: (Document) -> Unit,
+private fun UploadedFileSelectionScreen(
+    onFileSelected: (UploadedFile) -> Unit,
     onCancel: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val db = remember { AppDatabase.getInstance(context) }
-    var documents by remember { mutableStateOf<List<Document>>(emptyList()) }
+    var files by remember { mutableStateOf<List<UploadedFile>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
-        documents = withContext(Dispatchers.IO) {
-            db.documentDao().getAllDocuments().first()
+        files = withContext(Dispatchers.IO) {
+            db.uploadedFileDao().getAllFiles().first()
         }
         isLoading = false
     }
@@ -309,7 +314,7 @@ private fun DocumentSelectionScreen(
         topBar = {
             @OptIn(ExperimentalMaterial3Api::class)
             TopAppBar(
-                title = { Text("Select a Document") },
+                title = { Text("Select a File") },
                 navigationIcon = {
                     TextButton(onClick = onCancel) {
                         Text("Cancel")
@@ -327,7 +332,7 @@ private fun DocumentSelectionScreen(
             ) {
                 CircularProgressIndicator()
             }
-        } else if (documents.isEmpty()) {
+        } else if (files.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -336,13 +341,13 @@ private fun DocumentSelectionScreen(
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        "No documents in vault",
+                        "No files in vault",
                         fontSize = 18.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "Open ThaLock to add documents first",
+                        "Upload a file in ThaLock first",
                         fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
                     )
@@ -354,13 +359,13 @@ private fun DocumentSelectionScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(paddingValues)
             ) {
-                items(documents, key = { it.id }) { document ->
+                items(files, key = { it.id }) { file ->
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surfaceVariant,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onDocumentSelected(document) }
+                            .clickable { onFileSelected(file) }
                     ) {
                         Row(
                             modifier = Modifier.padding(16.dp),
@@ -374,14 +379,12 @@ private fun DocumentSelectionScreen(
                             Spacer(modifier = Modifier.width(16.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = document.title,
+                                    text = file.name,
                                     fontWeight = FontWeight.Medium,
                                     fontSize = 16.sp
                                 )
                                 Text(
-                                    text = document.country
-                                        ?.let { "${it.displayName} - ${document.documentType.displayName}" }
-                                        ?: document.documentType.displayName,
+                                    text = "${file.category.displayName} • ${file.mimeType ?: "file"}",
                                     fontSize = 13.sp,
                                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                                 )

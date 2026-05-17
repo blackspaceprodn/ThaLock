@@ -22,10 +22,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.io.File
 import com.thalock.app.data.model.Country
 import com.thalock.app.data.model.DocumentCategory
 import com.thalock.app.data.model.DocumentTemplate
@@ -113,59 +116,6 @@ private fun CategoryPicker(
             onClick = { onCategoryClick(category) }
         )
         Spacer(modifier = Modifier.height(spacing.cardGap))
-    }
-
-    Spacer(modifier = Modifier.height(spacing.sm))
-
-    // "Scan instead" outlined option
-    Surface(
-        shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp, MaterialTheme.colorScheme.outlineVariant
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = { /* TODO: wire scan-detect when available */ })
-    ) {
-        Row(
-            modifier = Modifier.padding(spacing.cardPadding),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Surface(
-                shape = RoundedCornerShape(10.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier.size(40.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                    Icon(
-                        Icons.Outlined.DocumentScanner,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.width(spacing.cardGap))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    "Scan instead",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    "We'll detect the type automatically",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Icon(
-                Icons.Outlined.ChevronRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
     }
 }
 
@@ -344,11 +294,127 @@ fun AddDocumentFormScreen(
     val spacing = LocalSpacing.current
 
     var showAddFieldDialog by remember { mutableStateOf(false) }
+    // Whether the "Scan" button has expanded into its Camera / Gallery
+    // chooser dialog.
+    var showScanChooser by remember { mutableStateOf(false) }
 
-    val imagePickerLauncher = rememberLauncherForActivityResult(
+    val context = LocalContext.current
+
+    // Gallery path for the Scan button: user picks an existing image to OCR.
+    // Scoped to image MIMEs via GetContent so the system surfaces the photos
+    // UI rather than the generic file manager.
+    val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
-        uri?.let { viewModel.processOcr(it) }
+        uri?.let {
+            val resolver = context.contentResolver
+            val name = queryDisplayName(context, it)
+            viewModel.processOcr(
+                uri = it,
+                displayName = name,
+                mimeType = resolver.getType(it),
+                source = AttachmentSource.UPLOAD
+            )
+        }
+    }
+
+    // Upload path: user picks ANY file (PDF, doc, image, etc.) from the
+    // system file browser. OpenDocument surfaces the DocumentsUI picker so
+    // the user sees their real Downloads / Drive / internal storage — not
+    // just the photo gallery. Non-image uploads skip OCR in the ViewModel
+    // and are simply filed in the Files tab on save.
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            val resolver = context.contentResolver
+            // Take a persistable read grant so the URI stays readable long
+            // enough for us to copy the bytes into encrypted storage. The
+            // takePersistableUriPermission call is safe to no-op if the
+            // provider refuses; we catch and ignore.
+            runCatching {
+                resolver.takePersistableUriPermission(
+                    it,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            val name = queryDisplayName(context, it)
+            viewModel.processOcr(
+                uri = it,
+                displayName = name,
+                mimeType = resolver.getType(it),
+                source = AttachmentSource.UPLOAD
+            )
+        }
+    }
+
+    // Camera-capture path: we stage a FileProvider URI into cache/captures
+    // ahead of time and hand it to TakePicture. The contract writes the
+    // JPEG there, then we feed that same URI through the OCR+stage flow.
+    // Cache file is deleted once the ViewModel has re-encrypted the bytes.
+    var pendingCameraFile by remember { mutableStateOf<File?>(null) }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success: Boolean ->
+        val capturedFile = pendingCameraFile
+        val capturedUri = pendingCameraUri
+        pendingCameraFile = null
+        pendingCameraUri = null
+        if (success && capturedUri != null) {
+            viewModel.processOcr(
+                uri = capturedUri,
+                displayName = capturedFile?.name,
+                mimeType = "image/jpeg",
+                source = AttachmentSource.CAMERA
+            )
+        } else {
+            // User cancelled — clean up the empty scratch file.
+            capturedFile?.delete()
+        }
+    }
+
+    // Because we declare android.permission.CAMERA in the manifest, the
+    // TakePicture intent will be denied silently unless the user has granted
+    // the runtime permission. Request it on demand; on grant, immediately
+    // launch the camera with the prepared URI.
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted: Boolean ->
+        val uri = pendingCameraUri
+        if (granted && uri != null) {
+            cameraLauncher.launch(uri)
+        } else if (!granted) {
+            // User denied — discard the scratch file we prepared.
+            pendingCameraFile?.delete()
+            pendingCameraFile = null
+            pendingCameraUri = null
+        }
+    }
+
+    // Shared entry point for the camera flow — reused by the Scan chooser's
+    // "Camera" option. Prepares a FileProvider URI, then either launches the
+    // camera directly (permission already granted) or routes through the
+    // runtime-permission request first.
+    val launchCamera: () -> Unit = {
+        val dir = File(context.cacheDir, "captures").apply { mkdirs() }
+        val file = File(dir, "capture_${System.currentTimeMillis()}.jpg")
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        pendingCameraFile = file
+        pendingCameraUri = uri
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.CAMERA
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            cameraLauncher.launch(uri)
+        } else {
+            cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+        }
     }
 
     // Initialize VM with chosen type
@@ -511,28 +577,59 @@ fun AddDocumentFormScreen(
 
                 Spacer(modifier = Modifier.height(spacing.lg))
 
-                // Scan option
-                FilledTonalButton(
-                    onClick = { imagePickerLauncher.launch("image/*") },
-                    enabled = !isProcessingOcr,
-                    shape = RoundedCornerShape(999.dp),
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
+                // Scan / upload options — two buttons side by side.
+                // Camera launches TakePicture with a FileProvider-backed temp
+                // URI; Upload pulls from gallery/files via GetContent. Both
+                // run OCR and, on save, are filed into the Files tab as an
+                // UploadedFile linked to the saved Document.
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(spacing.cardGap),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Icon(
-                        Icons.Outlined.CenterFocusWeak,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(modifier = Modifier.width(spacing.sm))
-                    Text(
-                        "Scan to auto-fill",
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    FilledTonalButton(
+                        onClick = { showScanChooser = true },
+                        enabled = !isProcessingOcr,
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.PhotoCamera,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(spacing.sm))
+                        Text(
+                            "Scan",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    FilledTonalButton(
+                        onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                        enabled = !isProcessingOcr,
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                    ) {
+                        Icon(
+                            Icons.Outlined.UploadFile,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(spacing.sm))
+                        Text(
+                            "Upload",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
 
                 AnimatedVisibility(visible = isProcessingOcr) {
@@ -760,6 +857,114 @@ fun AddDocumentFormScreen(
             }
         )
     }
+
+    if (showScanChooser) {
+        ScanSourceChooserDialog(
+            onDismiss = { showScanChooser = false },
+            onCamera = {
+                showScanChooser = false
+                launchCamera()
+            },
+            onGallery = {
+                showScanChooser = false
+                galleryLauncher.launch("image/*")
+            }
+        )
+    }
+}
+
+/**
+ * Chooser shown when the user taps "Scan" — lets them grab an image from
+ * the camera or pick an existing photo from the gallery. Both paths end up
+ * running OCR and staging the bytes as an attachment; only the source
+ * differs. The Upload button bypasses this dialog entirely and goes to the
+ * SAF file picker for arbitrary file types.
+ */
+@Composable
+private fun ScanSourceChooserDialog(
+    onDismiss: () -> Unit,
+    onCamera: () -> Unit,
+    onGallery: () -> Unit
+) {
+    val spacing = LocalSpacing.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Scan document") },
+        text = {
+            Column {
+                Text(
+                    "Choose where to pull the image from. We'll run text recognition and autofill the fields.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(spacing.md))
+                ScanSourceOption(
+                    icon = Icons.Outlined.PhotoCamera,
+                    title = "Camera",
+                    subtitle = "Take a new photo",
+                    onClick = onCamera
+                )
+                Spacer(modifier = Modifier.height(spacing.sm))
+                ScanSourceOption(
+                    icon = Icons.Outlined.PhotoLibrary,
+                    title = "Gallery",
+                    subtitle = "Pick an existing photo",
+                    onClick = onGallery
+                )
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun ScanSourceOption(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit
+) {
+    val spacing = LocalSpacing.current
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(spacing.cardPadding),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = ThaLockPrimary,
+                modifier = Modifier.size(22.dp)
+            )
+            Spacer(modifier = Modifier.width(spacing.cardGap))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Icon(
+                Icons.Outlined.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
 }
 
 @Composable
@@ -900,6 +1105,22 @@ private fun AddCustomFieldDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+/**
+ * Best-effort display-name lookup for a content URI picked through GetContent.
+ * Gmail, Google Files, and DocumentsUI all expose OpenableColumns.DISPLAY_NAME
+ * in their cursors; if the provider doesn't, we fall back to the URI's last
+ * path segment.
+ */
+private fun queryDisplayName(context: android.content.Context, uri: Uri): String? {
+    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+        if (idx >= 0 && cursor.moveToFirst()) {
+            return cursor.getString(idx)
+        }
+    }
+    return uri.lastPathSegment
 }
 
 private fun getPlaceholder(label: String): String {

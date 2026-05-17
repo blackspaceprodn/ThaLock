@@ -1,8 +1,19 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("com.google.devtools.ksp")
 }
+
+// Release signing credentials are read from keystore.properties at the project
+// root. That file is gitignored — it holds the upload keystore path + passwords
+// and must NEVER be committed. CI should write it from secrets at build time.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps: Properties? = if (keystorePropsFile.exists()) {
+    Properties().apply { load(FileInputStream(keystorePropsFile)) }
+} else null
 
 android {
     namespace = "com.thalock.app"
@@ -20,10 +31,7 @@ android {
             useSupportLibrary = true
         }
 
-        // Room schema snapshots are emitted here on every compile so that
-        // real migrations (AutoMigration or hand-written Migration objects)
-        // can diff against a known prior version. Commit the JSON files under
-        // app/schemas/ — they are required to ever bump the DB version.
+        // Room schema snapshots are emitted here on every compile.
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
             arg("room.incremental", "true")
@@ -36,14 +44,45 @@ android {
         }
     }
 
+    signingConfigs {
+        // Only attempt to configure release signing if the properties file exists.
+        // This avoids sync errors for developers who only need debug builds.
+        if (keystoreProps != null) {
+            create("release") {
+                val storeFilePath = keystoreProps.getProperty("storeFile")
+                if (storeFilePath != null) {
+                    storeFile = rootProject.file(storeFilePath)
+                }
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+                
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            isDebuggable = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Use the release signing config if available. If keystore.properties
+            // is missing, this falls back to null, allowing the project to sync
+            // and build debug versions. Release AABs will be unsigned unless
+            // the file is provided.
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
@@ -68,7 +107,6 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        // 16 KB page size compatibility for Android 15+ devices
         jniLibs {
             useLegacyPackaging = false
         }
@@ -95,38 +133,31 @@ dependencies {
     // Navigation
     implementation("androidx.navigation:navigation-compose:2.8.5")
 
-    // Room (local database)
+    // Room
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
 
-    // SQLCipher (encrypted database)
+    // SQLCipher
     implementation("net.zetetic:sqlcipher-android:4.6.1")
     implementation("androidx.sqlite:sqlite-ktx:2.4.0")
 
     // Biometric
     implementation("androidx.biometric:biometric:1.1.0")
 
-    // ML Kit OCR (on-device, offline)
+    // ML Kit OCR
     implementation("com.google.mlkit:text-recognition:16.0.1")
 
-    // CameraX (for scanning)
+    // CameraX
     implementation("androidx.camera:camera-core:1.4.1")
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
 
-    // Coil (image loading)
+    // Coil
     implementation("io.coil-kt:coil-compose:2.7.0")
 
-    // Security (encrypted shared prefs).
-    //
-    // Pinned to the 1.1.0-alpha06 line: 1.0.0 is stable but relies on
-    // Tink APIs that fail on Android 12+ emulators / some OEM ROMs and has
-    // known issues with background reads. 1.1.0 has been on alpha for years
-    // without breaking API changes; upgrading to later 1.1.0-alphaXX is safe
-    // but do NOT bump to a 1.2.x / 2.x line without re-auditing the wrapped
-    // master-key rotation path in AppLockManager.
+    // Security
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // Gson
