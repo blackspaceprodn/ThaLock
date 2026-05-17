@@ -46,7 +46,7 @@ app never connects to the internet. Uninstalling deletes everything.
 Requires Android Studio Ladybug or newer and JDK 17.
 
 ```bash
-git clone https://github.com/yashwantp24/ThaLock.git
+git clone https://github.com/blackspaceprodn/ThaLock.git
 cd ThaLock
 ./gradlew assembleDebug
 ```
